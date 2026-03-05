@@ -20,7 +20,7 @@ from src import analyzers
 
 # 全局变量
 calibration_points = []
-worker_detector = None  # 用于子进程缓存模型
+worker_detector = None  # 用于子进程缓存模型实例
 
 def select_vertical_line(event, x, y, flags, param):
     global calibration_points
@@ -37,7 +37,7 @@ def init_worker(model_path, use_gpu):
     进程池初始化函数：每个子进程启动时仅运行一次，缓存模型实例。
     """
     global worker_detector
-    # 并行处理必须强制使用 IMAGE 模式
+    # 并行处理必须强制使用 IMAGE 模式，否则时间戳顺序会报错
     worker_detector = tracking.PoseDetectorMP(
         model_path=model_path, 
         use_gpu=use_gpu, 
@@ -46,21 +46,22 @@ def init_worker(model_path, use_gpu):
 
 def process_frame_worker(frame, frame_idx, rotate_deg):
     """
-    子进程任务：利用缓存的模型处理帧。
+    子进程任务：利用缓存的模型进行旋转处理和 AI 推理。
     """
     global worker_detector
     
-    # 1. 旋转校正
+    # 1. 旋转校正 (耗时 CPU 操作)
     h, w = frame.shape[:2]
     if rotate_deg != 0:
         M = cv2.getRotationMatrix2D((w // 2, h // 2), rotate_deg, 1.0)
         frame = cv2.warpAffine(frame, M, (w, h))
 
-    # 2. 推理 (直接使用缓存好的 worker_detector)
+    # 2. 推理 (使用缓存好的实例)
     results = worker_detector.predict_image(frame)
     return frame_idx, frame, results
 
 class FileVideoStream:
+    """多线程视频读取器，提前缓冲帧以加快处理速度"""
     def __init__(self, path, queue_size=128):
         self.stream = cv2.VideoCapture(path)
         self.stopped = False
@@ -95,7 +96,7 @@ class FileVideoStream:
         self.stream.release()
 
 def main():
-    parser = argparse.ArgumentParser(description="NintAi Parallel Pro")
+    parser = argparse.ArgumentParser(description="NintAi Parallel Pro BikeFit Studio")
     parser.add_argument("--input", "-i", type=str, required=True)
     parser.add_argument("--view", "-v", type=str, choices=['side', 'front', 'back'], default='side')
     parser.add_argument("--crank_mm", type=float, default=170.0)
@@ -109,7 +110,6 @@ def main():
     cap = cv2.VideoCapture(args.input)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
     
     # 1. 交互式旋转校准
     ret, first_frame = cap.read()
@@ -118,7 +118,7 @@ def main():
     cv2.resizeWindow(calib_win, 800, int(800 * height / width))
     cv2.imshow(calib_win, first_frame)
     cv2.setMouseCallback(calib_win, select_vertical_line, first_frame)
-    print("请点击两点定义垂线。按任意键继续...")
+    print("请在窗口中点击两个点定义一条【垂线】。完成后按任意键继续...")
     cv2.waitKey(0)
     cv2.destroyWindow(calib_win)
 
@@ -127,30 +127,39 @@ def main():
         p1, p2 = calibration_points[-2], calibration_points[-1]
         dx, dy = p2[0] - p1[0], p2[1] - p1[1]
         angle_deg = math.degrees(math.atan2(dy, dx))
-        # 修正旋转方向：顺时针为负，逆时针为正
+        # 使用你确认正确的补偿逻辑
         auto_rotate_deg = angle_deg - 90 
         print(f"自动矫正角度: {auto_rotate_deg:.2f}°")
     
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-    # 2. 初始化并行执行环境
-    frames_data = [] # 数据存储
+    # 2. 初始化环境
+    frames_data = [] 
     model_path = os.path.abspath(os.path.join(os.path.dirname(__file__), 'models/pose_landmarker_heavy.task'))
     
-    if args.view == 'front':
-        analyzer = analyzers.FrontViewAnalyzer(crank_mm=args.crank_mm, frames_data=frames_data)
-    elif args.view == 'back':
-        analyzer = analyzers.BackViewAnalyzer(frames_data=frames_data)
-    else:
-        analyzer = analyzers.SideViewAnalyzer(crank_mm=args.crank_mm, frames_data=frames_data)
+    # --- 重要：主线程初始化一个轻量级 detector 用于解析子进程传回的结果 ---
+    main_detector = tracking.PoseDetectorMP(model_path=model_path, use_gpu=False)
 
-    window_name = 'NintAi Parallel Processing'
+    if args.view == 'front':
+        analyzer = analyzers.FrontViewAnalyzer(crank_mm=args.crank_mm, frames_data=frames_data, detector=main_detector)
+    elif args.view == 'back':
+        analyzer = analyzers.BackViewAnalyzer(frames_data=frames_data, detector=main_detector)
+    else:
+        # 补全 SideViewAnalyzer 的 display 参数并传入 detector
+        analyzer = analyzers.SideViewAnalyzer(
+            crank_mm=args.crank_mm, 
+            display_w=640, 
+            display_h=int(640 * height / width), 
+            detector=main_detector, 
+            frames_data=frames_data
+        )
+
+    window_name = 'NintAi Processing'
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, 640, int(640 * height / width))
 
     fvs = FileVideoStream(args.input).start()
     
-    # 重要性能优化：使用 initializer 缓存模型实例
     num_workers = multiprocessing.cpu_count() - 1
     executor = ProcessPoolExecutor(
         max_workers=num_workers,
@@ -163,25 +172,28 @@ def main():
     next_frame_idx = 0
     submitted_count = 0
 
-    print(f"并行引擎启动 (核心数: {num_workers})...")
+    print(f"启动并行引擎 (Workers: {num_workers})...")
 
     try:
         while fvs.more() or futures:
+            # 生产者：提交任务
             while fvs.more() and len(futures) < num_workers * 2:
                 frame = fvs.read()
-                # 修复：只传递 3 个参数 (frame, frame_idx, rotate_deg)
-                futures.append(executor.submit(
-                process_frame_worker, frame, submitted_count, auto_rotate_deg))
+                # 修复：仅传递 3 个参数
+                futures.append(executor.submit(process_frame_worker, frame, submitted_count, auto_rotate_deg))
                 submitted_count += 1
 
+            # 消费者：检查已完成任务
             done_list = [f for f in futures if f.done()]
             for f in done_list:
                 f_idx, p_frame, res = f.result()
                 results_cache[f_idx] = (p_frame, res)
                 futures.remove(f)
 
+            # 按顺序显示结果，确保护航 OneEuroFilter 的时序
             while next_frame_idx in results_cache:
                 p_frame, res = results_cache.pop(next_frame_idx)
+                # Analyzer 现在有 detector，可以解析数据并绘图了
                 processed_frame, _ = analyzer.process(p_frame, res, next_frame_idx)
                 cv2.imshow(window_name, processed_frame)
                 next_frame_idx += 1
@@ -194,36 +206,64 @@ def main():
         executor.shutdown(wait=False)
         cv2.destroyAllWindows()
 
-    # 3. 报告生成 (移除重复逻辑)
+    # ... (前面的并行处理循环保持不变) ...
+
+    # src/analyze_video.py 中的报告生成部分
+
+    # src/analyze_video.py
+
+    # 3. 报告生成
     if not frames_data:
-        print("未检测到有效姿态数据")
-        sys.exit()
+        print("未检测到有效姿态数据"); sys.exit()
 
     if args.view == 'front':
-        df_front = pd.DataFrame([
-            {
-                'frame_idx': f['frame_idx'],
-                'left_knee_x_offset': f['angles'].get('left_knee_x_offset', 0),
-                'right_knee_x_offset': f['angles'].get('right_knee_x_offset', 0)
-            } for f in frames_data
-        ])
+        df_front = pd.DataFrame([f['angles'] for f in frames_data])
         
+        # 修正：确保键名与 ai_report.py 完全一致
         stats = {
-            'left_valgus_std': df_front['left_knee_x_offset'].std(),
-            'right_valgus_std': df_front['right_knee_x_offset'].std(),
-            'left_valgus_avg': df_front['left_knee_x_offset'].mean(),
-            'right_valgus_avg': df_front['right_knee_x_offset'].mean()
+            'left_valgus_std': df_front['left_knee_x_offset'].std() if 'left_knee_x_offset' in df_front else 0,
+            'right_valgus_std': df_front['right_knee_x_offset'].std() if 'right_knee_x_offset' in df_front else 0,
+            'left_valgus_avg': df_front['left_knee_x_offset'].mean() if 'left_knee_x_offset' in df_front else 0,
+            'right_valgus_avg': df_front['right_knee_x_offset'].mean() if 'right_knee_x_offset' in df_front else 0
         }
         
+        # 完善控制台打印（包含双侧）
+        print("\n" + "="*30 + " 膝盖稳定性分析 (正面) " + "="*30)
+        print(f"右膝稳定性 (STD): {stats['right_valgus_std']:.2f} px")
+        print(f"右膝偏移均值: {stats['right_valgus_avg']:.1f} px ({'内扣' if stats['right_valgus_avg']>0 else '外摆'})")
+        print(f"左膝稳定性 (STD): {stats['left_valgus_std']:.2f} px")
+        print(f"左膝偏移均值: {stats['left_valgus_avg']:.1f} px ({'内扣' if stats['left_valgus_avg']<0 else '外摆'})")
+        
         prompt = ai_report.generate_diagnostic_prompt(stats, 'front')
-        print("\n" + "="*20 + " 诊断结论 " + "="*20)
-        print(prompt)
-
         report_path = os.path.join(report_dir, "front_view_diagnosis.md")
-        with open(report_path, "w", encoding="utf-8") as f:
-            f.write(prompt)
-        print(f"\n[系统提示] 报告已保存至: {report_path}")
 
+    elif args.view == 'side':
+        df_side = pd.DataFrame([f['angles'] for f in frames_data if f['angles'].get('knee', 0) > 0])
+        if df_side.empty: sys.exit()
+
+        # 补全侧面分析所需的生理指标
+        stats = {
+            'knee_ext_max': df_side['knee'].max(),
+            'knee_flex_min': df_side['knee'].min(),
+            'hip_closed_min': df_side['hip'].min(),
+            'back_avg': df_side['back'].mean(),
+            'foot_angle_avg': df_side['foot_angle'].mean()
+        }
+        
+        print("\n" + "="*30 + " 侧面生物力学深度分析 " + "="*30)
+        print(f"膝盖最大伸展角: {stats['knee_ext_max']:.1f}° (建议 140-150°)")
+        print(f"膝盖最小压缩角: {stats['knee_flex_min']:.1f}° (过紧可能导致上死点不适)")
+        print(f"髋部最小闭合角: {stats['hip_closed_min']:.1f}° (小于45°会感到憋气或顶肚子)")
+        
+        prompt = ai_report.generate_diagnostic_prompt(stats, 'side')
+        report_path = os.path.join(report_dir, "side_view_diagnosis.md")
+
+    # 统一保存报告
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(prompt)
+    print(f"\n[系统提示] 详细诊断报告已保存至: {report_path}")
+    
+    
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     main()
