@@ -105,59 +105,71 @@ class SideViewAnalyzer:
 
 
 # src/analyzers.py
+# src/analyzers.py 中的 FrontViewAnalyzer 部分
 
 class FrontViewAnalyzer:
-    def __init__(self, crank_mm=None, display_w=None, display_h=None, detector=None, frames_data=None, is_mirrored=True):
-        self.crank_mm = crank_mm
-        self.display_w = display_w
-        self.display_h = display_h
-        self.detector = detector
+    def __init__(self, crank_mm=170, frames_data=None, is_mirrored=True):
         self.frames_data = frames_data if frames_data is not None else []
-        self.is_mirrored = is_mirrored # 默认开启镜像处理
+        self.is_mirrored = is_mirrored
 
     def process(self, frame, results, frame_count):
         if not results.pose_landmarks or len(results.pose_landmarks) == 0:
             return frame, False
             
         h, w = frame.shape[:2]
-        landmarks = results.pose_landmarks[0]
+        # 使用 standard 映射获取所有点
+        from src.tracking_mp import PoseDetectorMP
+        # 借用 detector 的逻辑转换数据
+        lm = self._get_landmarks_dict(results.pose_landmarks[0], (h, w))
         
-        # 提取关键点坐标（MediaPipe 默认：0-鼻, 25-左膝, 26-右膝, 27-左踝, 28-右踝）
-        # 注意：MediaPipe 识别的是生物学上的左右。如果视频是镜像的，
-        # 画面左边的腿其实是人的右腿（索引26）。
-        
-        lm = {}
-        mapping = {25: 'left_knee', 26: 'right_knee', 27: 'left_ankle', 28: 'right_ankle'}
-        for idx, name in mapping.items():
-            pt = landmarks[idx]
-            lm[name] = [pt.x * w, pt.y * h]
-
         overlay = frame.copy()
-        current_frame_metrics = {'frame_idx': frame_count, 'angles': {}, 'landmarks': lm}
+        current_angles = {}
 
+        # 绘制双腿骨架
         for side in ['left', 'right']:
-            knee = lm.get(f'{side}_knee')
-            ankle = lm.get(f'{side}_ankle')
+            k_key = f'{side}_knee'
+            a_key = f'{side}_ankle'
+            h_key = f'{side}_hip'
             
-            if knee and ankle:
-                # 计算横向偏移 (Knee Tracking)
-                # 理想状态下，膝盖应该在脚踝的正上方
+            if all(k in lm for k in [k_key, a_key, h_key]):
+                knee = lm[k_key]
+                ankle = lm[a_key]
+                hip = lm[h_key]
+                
+                # 计算偏移
                 x_offset = knee[0] - ankle[0]
-                
-                # 如果是镜像视频，我们需要反转 X 轴的偏移逻辑，以便符合“向内/向外”的直觉
+                # 镜像处理：如果是自拍镜像，左右反转
                 actual_offset = -x_offset if self.is_mirrored else x_offset
+                current_angles[f'{side}_knee_x_offset'] = actual_offset
                 
-                # 记录数据
-                current_frame_metrics['angles'][f'{side}_knee_x_offset'] = actual_offset
+                # 绘图：画出髋-膝-踝连线
+                pts = np.array([hip, knee, ankle], np.int32)
+                cv2.polylines(overlay, [pts], False, (0, 255, 255), 3)
+                cv2.circle(overlay, tuple(pts[1]), 8, (0, 0, 255) if abs(actual_offset) > 35 else (0, 255, 0), -1)
                 
-                # 绘制辅助线：脚踝垂直基准线
+                # 画垂线
                 cv2.line(overlay, (int(ankle[0]), 0), (int(ankle[0]), h), (255, 0, 0), 1)
-                # 绘制膝盖点：正常绿色，内扣严重红色
-                color = (0, 0, 255) if abs(actual_offset) > 40 else (0, 255, 0)
-                cv2.circle(overlay, (int(knee[0]), int(knee[1])), 8, color, -1)
-                
-        self.frames_data.append(current_frame_metrics)
+
+        self.frames_data.append({
+            'frame_idx': frame_count,
+            'angles': current_angles,
+            'landmarks': lm
+        })
         return overlay, True
+
+    def _get_landmarks_dict(self, landmarks, shape):
+            h, w = shape
+            res = {}
+            # MediaPipe 索引: 23-L Hip, 24-R Hip, 25-L Knee, 26-R Knee, 27-L Ankle, 28-R Ankle
+            mapping = {23:'left_hip', 24:'right_hip', 25:'left_knee', 26:'right_knee', 27:'left_ankle', 28:'right_ankle'}
+            
+            # landmarks 在 Tasks API 中已经是 List[NormalizedLandmark]
+            for idx, name in mapping.items():
+                if idx < len(landmarks):
+                    lm = landmarks[idx] # 修正：直接索引访问
+                    if lm.visibility > 0.5:
+                        res[name] = [lm.x * w, lm.y * h]
+            return res
     
 # --- 背面分析器：专攻骨盆稳定性 ---
 class BackViewAnalyzer:
