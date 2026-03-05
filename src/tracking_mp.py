@@ -8,7 +8,7 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
 class PoseDetectorMP:
-    def __init__(self, model_path='src/models/pose_landmarker_heavy.task', model_complexity=2):
+    def __init__(self, model_path='src/models/pose_landmarker_heavy.task', model_complexity=2, use_gpu=True):
         """
         Initializes MediaPipe Pose Landmarker (Tasks API).
         """
@@ -16,19 +16,39 @@ class PoseDetectorMP:
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model not found at {model_path}. Please download it.")
 
-        base_options = python.BaseOptions(model_asset_path=model_path)
-        
-        # Video mode for consistent tracking
-        options = vision.PoseLandmarkerOptions(
-            base_options=base_options,
-            running_mode=vision.RunningMode.VIDEO,
-            num_poses=1,
-            min_pose_detection_confidence=0.5,
-            min_pose_presence_confidence=0.5,
-            min_tracking_confidence=0.5,
-            output_segmentation_masks=False
-        )
-        self.landmarker = vision.PoseLandmarker.create_from_options(options)
+        # 尝试使用 GPU，如果失败则回退到 CPU
+        try:
+            delegate = python.BaseOptions.Delegate.GPU if use_gpu else python.BaseOptions.Delegate.CPU
+            print(f"Attempting to use: {'GPU' if use_gpu else 'CPU'}")
+            
+            base_options = python.BaseOptions(model_asset_path=model_path, delegate=delegate)
+            options = vision.PoseLandmarkerOptions(
+                base_options=base_options,
+                running_mode=vision.RunningMode.VIDEO,
+                num_poses=1,
+                min_pose_detection_confidence=0.5,
+                min_pose_presence_confidence=0.5,
+                min_tracking_confidence=0.5,
+                output_segmentation_masks=False
+            )
+            self.landmarker = vision.PoseLandmarker.create_from_options(options)
+        except Exception as e:
+            if use_gpu:
+                print(f"Warning: GPU acceleration failed ({e}). Falling back to CPU...")
+                # 重新初始化为 CPU 模式
+                base_options = python.BaseOptions(model_asset_path=model_path, delegate=python.BaseOptions.Delegate.CPU)
+                options = vision.PoseLandmarkerOptions(
+                    base_options=base_options,
+                    running_mode=vision.RunningMode.VIDEO,
+                    num_poses=1,
+                    min_pose_detection_confidence=0.5,
+                    min_pose_presence_confidence=0.5,
+                    min_tracking_confidence=0.5,
+                    output_segmentation_masks=False
+                )
+                self.landmarker = vision.PoseLandmarker.create_from_options(options)
+            else:
+                raise e
 
     def predict(self, image, timestamp_ms=None):
         """

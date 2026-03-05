@@ -30,10 +30,22 @@ class OneEuroFilter:
         return x_hat
 
 def calculate_angle(a, b, c):
+    """
+    鲁棒性更强的角度计算：防止广角畸变导致的计算越界
+    """
     a, b, c = np.array(a), np.array(b), np.array(c)
-    radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
-    angle = np.abs(radians * 180.0 / np.pi)
-    if angle > 180.0: angle = 360 - angle
+    # 向量 ba 和 bc
+    v1 = a - b
+    v2 = c - b
+    
+    # 使用单位向量计算
+    unit_v1 = v1 / (np.linalg.norm(v1) + 1e-6)
+    unit_v2 = v2 / (np.linalg.norm(v2) + 1e-6)
+    
+    # 余弦值裁剪在 [-1, 1] 范围内，防止由于浮点精度导致 arccos 崩溃
+    dot_product = np.dot(unit_v1, unit_v2)
+    angle = np.degrees(np.arccos(np.clip(dot_product, -1.0, 1.0)))
+    
     return angle
 
 def calculate_angle_horizontal(a, b):
@@ -79,25 +91,29 @@ def detect_side(lm_dict):
         
     return 'left'
 
+# src/core.py
+
 def get_primary_landmarks(lm_dict, facing_side):
-    left_keys = ['left_shoulder', 'left_hip', 'left_knee', 'left_ankle', 'left_heel', 'left_toe']
-    right_keys = ['right_shoulder', 'right_hip', 'right_knee', 'right_ankle', 'right_heel', 'right_toe']
-    
-    l_count = sum(1 for k in left_keys if k in lm_dict)
-    r_count = sum(1 for k in right_keys if k in lm_dict)
-    
-    prefix = 'left_' if l_count >= r_count else 'right_'
+    # 强制使用传入的锁定侧，不再根据点数多少动态切换
+    prefix = f"{facing_side}_"
     
     unified = {}
     for k, v in lm_dict.items():
         if k.startswith(prefix):
+            # 将 'right_knee' 统一为 'knee' 方便后面计算
             unified[k.replace(prefix, '')] = v
         unified[k] = v 
-    unified['side'] = prefix.replace('_', '')
+    
+    unified['side'] = facing_side
     return unified
 
 def analyze_posture(lm):
     angles = {}
+    # 记录原始的膝盖水平偏移，用于正面视角分析内扣
+    if 'knee' in lm and 'ankle' in lm:
+        angles['knee_x_offset'] = lm['knee'][0] - lm['ankle'][0]
+    else:
+        angles['knee_x_offset'] = 0
     def valid(pt): return pt is not None and not (pt[0] == 0 and pt[1] == 0)
 
     if valid(lm.get('hip')) and valid(lm.get('knee')) and valid(lm.get('ankle')):
@@ -143,3 +159,13 @@ def get_feedback(knee_angle, arm_avg):
         if knee_angle < 140: feedback_lines.append(f"Knee Extension low ({knee_angle:.0f}°). Raise Saddle.")
         elif knee_angle > 150: feedback_lines.append(f"Knee Extension high ({knee_angle:.0f}°). Lower Saddle.")
     return feedback_lines, {}, {}
+
+def calculate_knee_tracking(lm):
+    """
+    计算膝盖相对于脚踝的水平偏移（正面视角专用）
+    返回：x_offset (像素值)。正值代表膝盖偏向一侧，负值代表另一侧。
+    """
+    if 'knee' in lm and 'ankle' in lm:
+        # 计算膝盖 x 坐标与脚踝 x 坐标的差值
+        return lm['knee'][0] - lm['ankle'][0]
+    return 0
