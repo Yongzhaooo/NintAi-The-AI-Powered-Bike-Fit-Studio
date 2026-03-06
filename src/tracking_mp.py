@@ -1,3 +1,13 @@
+'''
+Copyright    : yongzhao.derek@gmail.com
+FilePath     : \\NintAi-The-AI-Powered-Bike-Fit-Studio\\src\\tracking_mp.py
+Author       : Yongzhao Chen
+Date         : 2026-03-06 18:15:44
+LastEditTime : 2026-03-06 18:15:44
+LastEditors  : Yongzhao Chen && yongzhao.derek@gmail.com
+Version      : 1.0
+Describe & Note: 
+'''
 import mediapipe as mp
 import cv2
 import numpy as np
@@ -23,11 +33,15 @@ class PoseDetectorMP:
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
         return self.landmarker.detect(mp_image)
 
+    # src/tracking_mp.py 局部修改
+
     def get_landmarks_dict(self, results, image_shape):
         if not results or not results.pose_landmarks: return {}
         h, w = image_shape[:2]
         lm_dict = {}
         landmarks = results.pose_landmarks[0]
+        
+        # 映射关系不变
         mapping = {
             0: 'nose', 7: 'left_ear', 8: 'right_ear',
             11: 'left_shoulder', 12: 'right_shoulder', 13: 'left_elbow', 14: 'right_elbow',
@@ -35,8 +49,12 @@ class PoseDetectorMP:
             25: 'left_knee', 26: 'right_knee', 27: 'left_ankle', 28: 'right_ankle',
             29: 'left_heel', 30: 'right_heel', 31: 'left_toe', 32: 'right_toe'
         }
+        
         for idx, name in mapping.items():
             if idx < len(landmarks):
                 lm = landmarks[idx]
-                if lm.visibility > 0.3: lm_dict[name] = [lm.x * w, lm.y * h]
+                # --- 修改点：脚部点位(29-32)给予更低的阈值，提高识别率 ---
+                threshold = 0.3 if idx >= 29 else 0.5 
+                if lm.visibility > threshold:
+                    lm_dict[name] = [lm.x * w, lm.y * h]
         return lm_dict

@@ -111,7 +111,9 @@ class PoseDetectorRTM:
         }
         
         for idx, name in mapping.items():
-            # 核心修改：返回 [x, y, confidence]，让分析器能自动识别侧边
-            lm_dict[name] = [float(kpts[idx][0]), float(kpts[idx][1]), float(conf[idx])]
+            # only include landmarks with reasonable confidence
+            conf_i = float(conf[idx])
+            if conf_i > 0.3:
+                lm_dict[name] = [float(kpts[idx][0]), float(kpts[idx][1]), conf_i]
         
         return lm_dict
