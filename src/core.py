@@ -1,3 +1,4 @@
+# src/core.py
 import numpy as np
 import cv2
 import math
@@ -10,7 +11,6 @@ class OneEuroFilter:
         self.min_cutoff = min_cutoff
         self.beta = beta
         self.d_cutoff = d_cutoff
-        self.alpha = self._alpha(min_cutoff)
 
     def _alpha(self, cutoff):
         tau = 1.0 / (2 * np.pi * cutoff)
@@ -24,148 +24,55 @@ class OneEuroFilter:
         cutoff = self.min_cutoff + self.beta * np.abs(dx_hat)
         a = self._alpha(cutoff)
         x_hat = a * x + (1 - a) * self.x_prev
-        self.x_prev = x_hat
-        self.dx_prev = dx_hat
-        self.t_prev = t
+        self.x_prev, self.dx_prev, self.t_prev = x_hat, dx_hat, t
         return x_hat
 
 def calculate_angle(a, b, c):
-    """
-    鲁棒性更强的角度计算：防止广角畸变导致的计算越界
-    """
     a, b, c = np.array(a), np.array(b), np.array(c)
-    # 向量 ba 和 bc
-    v1 = a - b
-    v2 = c - b
-    
-    # 使用单位向量计算
+    v1, v2 = a - b, c - b
     unit_v1 = v1 / (np.linalg.norm(v1) + 1e-6)
     unit_v2 = v2 / (np.linalg.norm(v2) + 1e-6)
-    
-    # 余弦值裁剪在 [-1, 1] 范围内，防止由于浮点精度导致 arccos 崩溃
-    dot_product = np.dot(unit_v1, unit_v2)
-    angle = np.degrees(np.arccos(np.clip(dot_product, -1.0, 1.0)))
-    
-    return angle
+    return np.degrees(np.arccos(np.clip(np.dot(unit_v1, unit_v2), -1.0, 1.0)))
 
 def calculate_angle_horizontal(a, b):
     v = np.array(b) - np.array(a)
     return np.abs(np.degrees(np.arctan2(v[1], v[0])))
 
 def draw_angle_arc(image, p1, p2, p3, angle, color=(0, 255, 255), radius=30):
-    if p1 == (0,0) or p2 == (0,0) or p3 == (0,0): return
-    v1 = np.array(p1) - np.array(p2)
-    v2 = np.array(p3) - np.array(p2)
-    ang1 = np.degrees(np.arctan2(v1[1], v1[0]))
-    ang2 = np.degrees(np.arctan2(v2[1], v2[0]))
-    if ang1 < 0: ang1 += 360
-    if ang2 < 0: ang2 += 360
-    diff = ang2 - ang1
-    if diff < 0: diff += 360
-    if diff > 180:
-        start, end = ang2, ang1
-    else:
-        start, end = ang1, ang2
-    cv2.ellipse(image, p2, (radius, radius), 0, start, end, color, 2, cv2.LINE_AA)
-    text_x = int(p2[0] + radius * 1.5 * np.cos(np.radians((start+end)/2)))
-    text_y = int(p2[1] + radius * 1.5 * np.sin(np.radians((start+end)/2)))
-    cv2.putText(image, f"{int(angle)}", (text_x-10, text_y+5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
-
-def detect_side(lm_dict):
-    nose = lm_dict.get('nose')
-    l_ear = lm_dict.get('left_ear')
-    r_ear = lm_dict.get('right_ear')
-    
-    if nose is not None and l_ear is not None:
-        if nose[0] < l_ear[0]: return 'left'
-        else: return 'right'
-    if nose is not None and r_ear is not None:
-        if nose[0] < r_ear[0]: return 'left'
-        else: return 'right'
-        
-    l_hip = lm_dict.get('left_hip')
-    l_knee = lm_dict.get('left_knee')
-    if l_hip is not None and l_knee is not None:
-        if l_knee[0] < l_hip[0]: return 'left'
-        else: return 'right'
-        
-    return 'left'
-
-# src/core.py
+    v1, v2 = np.array(p1) - p2, np.array(p3) - p2
+    ang1, ang2 = np.degrees(np.arctan2(v1[1], v1[0])) % 360, np.degrees(np.arctan2(v2[1], v2[0])) % 360
+    start, end = (ang1, ang2) if abs(ang2-ang1) < 180 else (ang2, ang1)
+    cv2.ellipse(image, tuple(map(int, p2)), (radius, radius), 0, start, end, color, 2)
+    cv2.putText(image, f"{int(angle)}", (int(p2[0]-15), int(p2[1]-radius-5)), 1, 1, color, 1)
 
 def get_primary_landmarks(lm_dict, facing_side):
-    # 强制使用传入的锁定侧，不再根据点数多少动态切换
+    """
+    修改点：严格遵循分析器确定的 facing_side。
+    """
     prefix = f"{facing_side}_"
-    
-    unified = {}
+    unified = {'side': facing_side}
+    # 提取公共点
+    for k in ['nose', 'left_ear', 'right_ear']:
+        if k in lm_dict: unified[k] = lm_dict[k]
+    # 提取带侧边前缀的点并重命名（如 left_knee -> knee）
     for k, v in lm_dict.items():
         if k.startswith(prefix):
-            # 将 'right_knee' 统一为 'knee' 方便后面计算
             unified[k.replace(prefix, '')] = v
-        unified[k] = v 
-    
-    unified['side'] = facing_side
     return unified
 
 def analyze_posture(lm):
     angles = {}
-    # 记录原始的膝盖水平偏移，用于正面视角分析内扣
-    if 'knee' in lm and 'ankle' in lm:
-        angles['knee_x_offset'] = lm['knee'][0] - lm['ankle'][0]
-    else:
-        angles['knee_x_offset'] = 0
-    def valid(pt): return pt is not None and not (pt[0] == 0 and pt[1] == 0)
-
-    if valid(lm.get('hip')) and valid(lm.get('knee')) and valid(lm.get('ankle')):
+    vld = lambda pt: pt is not None and len(pt) == 2
+    if vld(lm.get('hip')) and vld(lm.get('knee')) and vld(lm.get('ankle')):
         angles['knee'] = calculate_angle(lm['hip'], lm['knee'], lm['ankle'])
     else: angles['knee'] = 0
-
-    if valid(lm.get('shoulder')) and valid(lm.get('hip')) and valid(lm.get('knee')):
+    if vld(lm.get('shoulder')) and vld(lm.get('hip')) and vld(lm.get('knee')):
         angles['hip'] = calculate_angle(lm['shoulder'], lm['hip'], lm['knee'])
     else: angles['hip'] = 0
-    
-    if valid(lm.get('shoulder')) and valid(lm.get('hip')):
+    if vld(lm.get('shoulder')) and vld(lm.get('hip')):
         angles['back'] = calculate_angle_horizontal(lm['hip'], lm['shoulder'])
     else: angles['back'] = 0
-    
-    if valid(lm.get('elbow')) and valid(lm.get('shoulder')) and valid(lm.get('hip')):
-        angles['arm_torso'] = calculate_angle(lm['elbow'], lm['shoulder'], lm['hip'])
-    else: angles['arm_torso'] = 0
-    
-    ear_pt = None
-    if 'ear' in lm: ear_pt = lm['ear']
-    elif 'side' in lm:
-        ear_pt = lm.get(f"{lm['side']}_ear")
-        
-    if valid(ear_pt) and valid(lm.get('shoulder')) and valid(lm.get('hip')):
-        angles['neck'] = calculate_angle(lm['hip'], lm['shoulder'], ear_pt)
-    else: angles['neck'] = 0
-    
-    if valid(lm.get('elbow')) and valid(lm.get('wrist')):
-        angles['wrist_tilt'] = calculate_angle_horizontal(lm['elbow'], lm['wrist'])
-    else: angles['wrist_tilt'] = 0
-    
-    # Real Foot Angle (Heel-Toe vs Horizontal)
-    # 0 deg = flat. + deg = toe up?
-    if valid(lm.get('heel')) and valid(lm.get('toe')):
+    if vld(lm.get('heel')) and vld(lm.get('toe')):
         angles['foot_angle'] = calculate_angle_horizontal(lm['heel'], lm['toe'])
     else: angles['foot_angle'] = 0
-
     return angles
-
-def get_feedback(knee_angle, arm_avg):
-    feedback_lines = []
-    if knee_angle > 0:
-        if knee_angle < 140: feedback_lines.append(f"Knee Extension low ({knee_angle:.0f}°). Raise Saddle.")
-        elif knee_angle > 150: feedback_lines.append(f"Knee Extension high ({knee_angle:.0f}°). Lower Saddle.")
-    return feedback_lines, {}, {}
-
-def calculate_knee_tracking(lm):
-    """
-    计算膝盖相对于脚踝的水平偏移（正面视角专用）
-    返回：x_offset (像素值)。正值代表膝盖偏向一侧，负值代表另一侧。
-    """
-    if 'knee' in lm and 'ankle' in lm:
-        # 计算膝盖 x 坐标与脚踝 x 坐标的差值
-        return lm['knee'][0] - lm['ankle'][0]
-    return 0

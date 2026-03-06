@@ -1,82 +1,80 @@
-# src/analyzers.py
 import numpy as np
 import cv2
-import pandas as pd
 from src import core
 
 class SideViewAnalyzer:
-    def __init__(self, crank_mm, display_w=None, display_h=None, detector=None, frames_data=None):
+    def __init__(self, crank_mm=170.0, frames_data=None, target_side=None, **kwargs):
         self.crank_mm = crank_mm
-        self.detector = detector
         self.frames_data = frames_data if frames_data is not None else []
-        # 优化滤波参数：适应高并发下的跳变
-        filter_keys = ['nose', 'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow',
-                       'left_wrist', 'right_wrist', 'left_hip', 'right_hip',
-                       'left_knee', 'right_knee', 'left_ankle', 'right_ankle',
-                       'left_heel', 'right_heel', 'left_toe', 'right_toe']
-        self.filters = {k: core.OneEuroFilter(t0=0, x0=np.zeros(2), min_cutoff=0.5, beta=0.005) for k in filter_keys}
+        self.locked_side = target_side
         self.side_votes = {'left': 0, 'right': 0}
-        self.locked_side = None
+        # 滤波器针对统一后的 Key
+        filter_keys = ['shoulder', 'hip', 'knee', 'ankle', 'toe', 'heel', 'elbow', 'wrist', 'nose']
+        self.filters = {k: core.OneEuroFilter(t0=0, x0=np.zeros(2)) for k in filter_keys}
 
-    def process(self, frame, results, frame_idx):
-        if not results or self.detector is None: return frame, False
-        raw_lm = self.detector.get_landmarks_dict(results, frame.shape)
-        if not raw_lm: return frame, False
-
-        # 平滑处理
-        clean_lm = {k: self.filters[k](frame_idx, np.array(v)) for k, v in raw_lm.items() if k in self.filters}
+    def process(self, frame, lm_dict, frame_idx):
+        if not lm_dict: return frame, False
         
-        # 侧边锁定逻辑
-        detected = core.detect_side(clean_lm)
+        # 1. 100 帧简易投票锁定逻辑
         if self.locked_side is None:
-            self.side_votes[detected] += 1
-            if frame_idx >= 30:
+            if 'left_knee' in lm_dict: self.side_votes['left'] += 1
+            if 'right_knee' in lm_dict: self.side_votes['right'] += 1
+            # 投票期间，哪边点多用哪边
+            current_side = 'left' if lm_dict.get('left_knee') else 'right'
+            # 满 100 帧后正式大选锁定
+            if frame_idx >= 100:
                 self.locked_side = 'left' if self.side_votes['left'] >= self.side_votes['right'] else 'right'
-            current_side = detected
+                print(f"\n[系统] 100帧投票完成，锁定侧边: {self.locked_side.upper()}")
         else:
             current_side = self.locked_side
 
-        # 解析运动学角度
-        unified_lm = core.get_primary_landmarks(clean_lm, current_side)
-        angles = core.analyze_posture(unified_lm)
+        # 2. 统一化与滤波
+        unified_lm = core.get_primary_landmarks(lm_dict, current_side)
+        clean_lm = {}
+        for k, v in unified_lm.items():
+            if k in self.filters:
+                clean_lm[k] = self.filters[k](frame_idx, np.array(v))
+            else: clean_lm[k] = v
 
-        self.frames_data.append({
-            'frame_idx': frame_idx, 'angles': angles, 'landmarks': unified_lm, 'side': current_side
-        })
-
-        self._draw_visuals(frame, unified_lm, angles)
+        # 3. 计算与存储
+        angles = core.analyze_posture(clean_lm)
+        self.frames_data.append({'frame_idx': frame_idx, 'angles': angles, 'side': current_side})
+        
+        # 4. 绘图
+        knee_angle = angles.get('knee', 0)
+        color = (0, 255, 0) if 140 <= knee_angle <= 150 else (0, 0, 255)
+        skel = [('shoulder', 'hip'), ('hip', 'knee'), ('knee', 'ankle'), ('shoulder', 'elbow')]
+        for k1, k2 in skel:
+            if k1 in clean_lm and k2 in clean_lm:
+                cv2.line(frame, tuple(map(int, clean_lm[k1])), tuple(map(int, clean_lm[k2])), color, 3)
+        if all(k in clean_lm for k in ['hip', 'knee', 'ankle']) and knee_angle > 0:
+            core.draw_angle_arc(frame, clean_lm['hip'], clean_lm['knee'], clean_lm['ankle'], knee_angle)
+        
+        cv2.putText(frame, f"SIDE: {current_side.upper()} | Knee: {knee_angle:.1f}", (20, 50), 1, 1.5, color, 2)
         return frame, True
-
-    def _draw_visuals(self, frame, lm, angles):
-        # 绘制生理连线
-        for k1, k2 in [('shoulder', 'hip'), ('hip', 'knee'), ('knee', 'ankle'), ('ankle', 'toe')]:
-            if k1 in lm and k2 in lm:
-                cv2.line(frame, tuple(map(int, lm[k1])), tuple(map(int, lm[k2])), (0, 255, 255), 3, cv2.LINE_AA)
-        cv2.putText(frame, f"Knee Ext: {angles.get('knee', 0):.1f}", (20, 50), 1, 1.8, (0, 255, 0), 2)
-
+        
 class FrontViewAnalyzer:
-    def __init__(self, crank_mm=170, frames_data=None, detector=None):
-        self.detector = detector
+    def __init__(self, crank_mm=170.0, frames_data=None, **kwargs):
+        """ 显式定义构造函数，解决 TypeError """
+        self.crank_mm = crank_mm
         self.frames_data = frames_data if frames_data is not None else []
 
-    def process(self, frame, results, frame_count):
-        if not results or self.detector is None: return frame, False
-        lm = self.detector.get_landmarks_dict(results, frame.shape)
-        if not lm: return frame, False
+    def process(self, frame, lm_dict, frame_count):
+        if not lm_dict: return frame, False
         
         h, w = frame.shape[:2]
         current_metrics = {}
         for side in ['left', 'right']:
-            k, a, hip = f'{side}_knee', f'{side}_ankle', f'{side}_hip'
-            if all(pt in lm for pt in [k, a, hip]):
-                # 计算膝盖相对于脚踝的横向偏移（px）
-                offset = lm[k][0] - lm[a][0]
+            k, a = f'{side}_knee', f'{side}_ankle'
+            if k in lm_dict and a in lm_dict:
+                offset = lm_dict[k][0] - lm_dict[a][0]
                 current_metrics[f'{side}_knee_x_offset'] = offset
                 
-                # 视觉反馈：力线追踪
-                cv2.line(frame, (int(lm[a][0]), 0), (int(lm[a][0]), h), (255, 0, 0), 1) # 脚踝基准垂线
-                cv2.line(frame, tuple(map(int, lm[hip])), tuple(map(int, lm[k])), (0, 255, 255), 2) # 髋-膝线
-                cv2.circle(frame, tuple(map(int, lm[k])), 7, (0, 255, 255), -1)
+                # 视觉反馈
+                cv2.circle(frame, tuple(map(int, lm_dict[a])), 10, (255, 0, 0), -1)
+                color = (0, 0, 255) if abs(offset) > 40 else (0, 255, 0)
+                cv2.circle(frame, tuple(map(int, lm_dict[k])), 8, color, -1)
+                cv2.line(frame, (int(lm_dict[a][0]), 0), (int(lm_dict[a][0]), h), (255, 0, 0), 1)
 
         self.frames_data.append({'frame_idx': frame_count, 'angles': current_metrics})
         return frame, True

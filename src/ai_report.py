@@ -1,5 +1,7 @@
 # src/ai_report.py
 
+
+
 def generate_front_prompt(stats):
     return f"""
 # 🚴 NintAi 骑行生物力学诊断申请书 (正面视角)
@@ -27,3 +29,13 @@ def generate_side_prompt(stats):
 | **平均脚踝角度 (Foot)** | {stats.get('foot_angle_avg', 0):.1f}° | 0° - 20° | - |
 ...
 """
+
+def generate_diagnostic_prompt(stats, view_type):
+    """
+    统一入口函数，根据视角调用对应的 Prompt 生成逻辑
+    """
+    if view_type == 'front':
+        return generate_front_prompt(stats)
+    elif view_type == 'side':
+        return generate_side_prompt(stats)
+    return "未知的视角类型"
